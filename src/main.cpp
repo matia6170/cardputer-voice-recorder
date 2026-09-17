@@ -1,7 +1,10 @@
 #include <Arduino.h>
 
+#include <ESPmDNS.h>
 #include <SD.h>
 #include <SPI.h>
+#include <WebServer.h>
+#include <WiFi.h>
 
 #include <algorithm>
 #include <vector>
@@ -14,16 +17,25 @@ static constexpr uint32_t SAMPLE_RATE = 16000;          // 16 kHz mono 16-bit PC
 static constexpr size_t CHUNK_SAMPLES = 1024;           // 64 ms per chunk
 static constexpr char REC_DIR[] = "/recordings";
 
+// Fileserver: a soft-AP that a phone or laptop joins to browse the whole SD
+// card from a browser. Plain HTTP, not HTTPS -- the ESP32 can only offer a
+// self-signed cert, which buys nothing but browser warnings on a private,
+// WPA2-protected network that nobody else is on.
+static constexpr char AP_SSID[] = "GGBOWL-rec";
+static constexpr char AP_PASS[] = "YUGOGGBOWL";
+static constexpr char AP_HOST[] = "cardputer";  // http://cardputer.local
+static constexpr uint16_t HTTP_PORT = 80;
+
 static M5Canvas canvas(&M5Cardputer.Display);
 
 // ---------- app state ----------
-enum class Screen { Menu, Browser, Recorder, Player };
+enum class Screen { Menu, Browser, Recorder, Player, FileServer };
 enum class RecState { Idle, Recording, Paused };
 
 static Screen screen = Screen::Menu;
 
-static const char* menuItems[] = {"File Browser", "Voice Recorder"};
-static constexpr int MENU_COUNT = 2;
+static const char* menuItems[] = {"File Browser", "Voice Recorder", "Fileserver"};
+static constexpr int MENU_COUNT = 3;
 static int menuSel = 0;
 
 struct FileEntry {
@@ -54,6 +66,15 @@ static int volume = 192;
 
 static String statusMsg;
 static uint32_t statusMsgUntil = 0;
+
+// fileserver state
+static WebServer httpServer(HTTP_PORT);
+static bool serverRunning = false;
+static IPAddress apIP;
+static uint32_t servedRequests = 0;
+static String xferName;  // file currently streaming out; empty when idle
+static uint32_t xferSent = 0, xferTotal = 0;
+static uint8_t xferBuf[4096];
 
 // ---------- helpers ----------
 static void showMsg(const String& msg, uint32_t ms = 3000) {
@@ -354,16 +375,278 @@ static void loadFiles() {
               [](const FileEntry& a, const FileEntry& b) { return a.name < b.name; });
 }
 
+// ---------- fileserver ----------
+static void drawFileServer();
+
+// A download holds the loop for as long as it takes; pump the keyboard, USB
+// and display from inside the transfer so the UI doesn't freeze.
+static void serverTick() {
+    M5Cardputer.update();
+    static uint32_t last = 0;
+    if (millis() - last >= 100) {
+        last = millis();
+        drawFileServer();
+    }
+}
+
+static String htmlEscape(const String& s) {
+    String out;
+    out.reserve(s.length() + 8);
+    for (size_t i = 0; i < s.length(); ++i) {
+        switch (s[i]) {
+            case '&':  out += "&amp;";  break;
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&#39;";  break;
+            default:   out += s[i];
+        }
+    }
+    return out;
+}
+
+static String urlEncode(const String& s) {
+    static const char hex[] = "0123456789ABCDEF";
+    String out;
+    out.reserve(s.length() + 16);
+    for (size_t i = 0; i < s.length(); ++i) {
+        const uint8_t c = (uint8_t)s[i];
+        if (isalnum(c) || strchr("-_.~/", c)) {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
+static String humanSize(uint32_t bytes) {
+    char buf[16];
+    if (bytes >= 1024u * 1024u) {
+        snprintf(buf, sizeof(buf), "%.1f MB", bytes / (1024.0 * 1024.0));
+    } else if (bytes >= 1024u) {
+        snprintf(buf, sizeof(buf), "%.1f KB", bytes / 1024.0);
+    } else {
+        snprintf(buf, sizeof(buf), "%u B", (unsigned)bytes);
+    }
+    return String(buf);
+}
+
+// Only the types worth previewing in a browser; everything else downloads.
+static String contentTypeFor(const String& path) {
+    String p = path;
+    p.toLowerCase();
+    if (p.endsWith(".wav")) return "audio/wav";
+    if (p.endsWith(".mp3")) return "audio/mpeg";
+    if (p.endsWith(".txt") || p.endsWith(".log") || p.endsWith(".ini") ||
+        p.endsWith(".md") || p.endsWith(".csv")) {
+        return "text/plain; charset=utf-8";
+    }
+    if (p.endsWith(".json")) return "application/json";
+    if (p.endsWith(".htm") || p.endsWith(".html")) return "text/html; charset=utf-8";
+    if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return "image/jpeg";
+    if (p.endsWith(".png")) return "image/png";
+    if (p.endsWith(".gif")) return "image/gif";
+    if (p.endsWith(".bmp")) return "image/bmp";
+    if (p.endsWith(".pdf")) return "application/pdf";
+    return "application/octet-stream";
+}
+
+// Absolute, and with no way to climb out of the card root.
+static bool pathIsSafe(const String& p) {
+    return p.length() > 0 && p[0] == '/' && p.indexOf("..") < 0;
+}
+
+static String joinPath(const String& dir, const String& name) {
+    return dir.endsWith("/") ? dir + name : dir + "/" + name;
+}
+
+static const char PAGE_HEAD[] =
+    "<!doctype html><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>Cardputer SD</title><style>"
+    "body{background:#111;color:#eee;font:16px system-ui,sans-serif;margin:0;padding:12px}"
+    "h1{font-size:15px;color:#4dd0e1;margin:0 0 10px;word-break:break-all}"
+    "ul{list-style:none;margin:0;padding:0}"
+    "li{display:flex;align-items:center;border-bottom:1px solid #262626}"
+    "a{color:#eee;text-decoration:none;padding:13px 4px}"
+    "a.r{flex:1;display:flex;gap:10px;align-items:baseline;min-width:0}"
+    "a.r:active{background:#1b2b3a}"
+    "a.g{color:#4dd0e1;font-size:19px;padding:13px 8px}"
+    ".n{flex:1;word-break:break-all}"
+    ".s{color:#888;font-size:13px;white-space:nowrap}"
+    ".d{color:#4dd0e1}.e{color:#888;padding:16px 4px}"
+    "</style>";
+
+static void sendListing(const String& dir) {
+    File d = SD.open(dir);
+    if (!d || !d.isDirectory()) {
+        if (d) d.close();
+        httpServer.send(404, "text/plain", "Not a directory: " + dir);
+        return;
+    }
+
+    struct Row {
+        String name;
+        uint32_t size;
+        bool isDir;
+    };
+    std::vector<Row> rows;
+    while (File f = d.openNextFile()) {
+        rows.push_back({String(f.name()), (uint32_t)f.size(), (bool)f.isDirectory()});
+        f.close();
+        if (rows.size() >= 512) break;  // keep RAM bounded on huge folders
+    }
+    d.close();
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+        if (a.isDir != b.isDir) return a.isDir;  // folders first
+        return a.name < b.name;
+    });
+
+    // Chunked, one row at a time: a big folder must not have to fit in RAM.
+    httpServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    httpServer.send(200, "text/html; charset=utf-8", "");
+    httpServer.sendContent(PAGE_HEAD, sizeof(PAGE_HEAD) - 1);
+    httpServer.sendContent("<h1>" + htmlEscape(dir) + "</h1><ul>");
+
+    if (dir != "/") {
+        const int slash = dir.lastIndexOf('/');
+        const String parent = slash > 0 ? dir.substring(0, slash) : String("/");
+        httpServer.sendContent("<li><a class=r href='/?dir=" + urlEncode(parent) +
+                               "'><span class='n d'>&#8592; ..</span></a></li>");
+    }
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const Row& r = rows[i];
+        const String full = urlEncode(joinPath(dir, r.name));
+        if (r.isDir) {
+            httpServer.sendContent("<li><a class=r href='/?dir=" + full +
+                                   "'><span class='n d'>" + htmlEscape(r.name) +
+                                   "/</span><span class=s>folder</span></a></li>");
+        } else {
+            // Name opens inline (a WAV just plays); the arrow forces a save.
+            httpServer.sendContent("<li><a class=r href='/dl?path=" + full +
+                                   "'><span class=n>" + htmlEscape(r.name) +
+                                   "</span><span class=s>" + humanSize(r.size) +
+                                   "</span></a><a class=g href='/dl?a=1&path=" + full +
+                                   "'>&#11015;</a></li>");
+        }
+    }
+    if (rows.empty()) httpServer.sendContent("<li class=e>empty folder</li>");
+
+    httpServer.sendContent("</ul>");
+    httpServer.sendContent("");  // end of chunked body
+}
+
+static void handleRoot() {
+    ++servedRequests;
+    if (!sdOk && !mountSD()) {
+        httpServer.send(503, "text/html; charset=utf-8",
+                        String(PAGE_HEAD) + "<h1>No SD card</h1>"
+                        "<p class=e>Insert a card and reload.</p>");
+        return;
+    }
+    String dir = httpServer.hasArg("dir") ? httpServer.arg("dir") : String("/");
+    if (dir.length() > 1 && dir.endsWith("/")) dir.remove(dir.length() - 1);
+    if (!pathIsSafe(dir)) {
+        httpServer.send(400, "text/plain", "Bad path");
+        return;
+    }
+    sendListing(dir);
+}
+
+static void handleDownload() {
+    ++servedRequests;
+    const String path = httpServer.arg("path");
+    if (!pathIsSafe(path)) {
+        httpServer.send(400, "text/plain", "Bad path");
+        return;
+    }
+    File f = SD.open(path, FILE_READ);
+    if (!f || f.isDirectory()) {
+        if (f) f.close();
+        httpServer.send(404, "text/plain", "Not found: " + path);
+        return;
+    }
+
+    if (httpServer.hasArg("a")) {
+        httpServer.sendHeader("Content-Disposition",
+                              "attachment; filename=\"" + baseName(path) + "\"");
+    }
+    httpServer.setContentLength(f.size());
+    httpServer.send(200, contentTypeFor(path), "");
+
+    // Hand-rolled instead of streamFile() so serverTick() can keep the screen
+    // and keyboard alive while a multi-megabyte WAV goes out.
+    WiFiClient client = httpServer.client();
+    xferName = baseName(path);
+    xferSent = 0;
+    xferTotal = f.size();
+    while (xferSent < xferTotal && client.connected()) {
+        const int n = f.read(xferBuf, sizeof(xferBuf));
+        if (n <= 0) break;
+        if (client.write(xferBuf, (size_t)n) != (size_t)n) break;
+        xferSent += n;
+        serverTick();
+    }
+    f.close();
+    xferName = "";
+}
+
+static void startFileServer() {
+    mountSD();  // pick up a card inserted after boot
+    M5Cardputer.Mic.end();  // don't leave the mic running behind the radio
+
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_AP);
+    if (!WiFi.softAP(AP_SSID, AP_PASS)) {
+        WiFi.mode(WIFI_OFF);
+        M5Cardputer.Mic.begin();
+        showMsg("AP start failed!");
+        return;
+    }
+    apIP = WiFi.softAPIP();
+
+    static bool routesReady = false;
+    if (!routesReady) {  // on() appends, so register exactly once
+        httpServer.on("/", HTTP_GET, handleRoot);
+        httpServer.on("/dl", HTTP_GET, handleDownload);
+        httpServer.onNotFound([] { httpServer.send(404, "text/plain", "Not found"); });
+        routesReady = true;
+    }
+    httpServer.begin();
+    if (MDNS.begin(AP_HOST)) MDNS.addService("http", "tcp", HTTP_PORT);
+
+    servedRequests = 0;
+    xferName = "";
+    serverRunning = true;
+    screen = Screen::FileServer;
+}
+
+static void stopFileServer() {
+    MDNS.end();
+    httpServer.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+    serverRunning = false;
+    xferName = "";
+    M5Cardputer.Mic.begin();
+    screen = Screen::Menu;
+}
+
 // ---------- input handling ----------
 static void handleMenu(const Keys& k) {
     if (k.up) menuSel = (menuSel + MENU_COUNT - 1) % MENU_COUNT;
     if (k.down) menuSel = (menuSel + 1) % MENU_COUNT;
     if (k.enter) {
-        if (menuSel == 0) {
-            loadFiles();
-            screen = Screen::Browser;
-        } else {
-            screen = Screen::Recorder;
+        switch (menuSel) {
+            case 0:
+                loadFiles();
+                screen = Screen::Browser;
+                break;
+            case 1: screen = Screen::Recorder; break;
+            case 2: startFileServer(); break;
         }
     }
 }
@@ -418,6 +701,10 @@ static void handleRecorder(const Keys& k) {
     }
 }
 
+static void handleFileServer(const Keys& k) {
+    if (k.esc) stopFileServer();
+}
+
 // ---------- drawing ----------
 static void drawStatusMsg() {
     if (statusMsg.length() && millis() < statusMsgUntil) {
@@ -454,7 +741,7 @@ static void drawMenu() {
     drawStatusMsg();
     canvas.setTextDatum(bottom_center);
     canvas.setTextColor(TFT_DARKGREY);
-    canvas.drawString("fn+; up  fn+. down  Enter: select", 120, 130);
+    canvas.drawString("fn+; up  fn+. down  Enter: select", 120, 133);
     canvas.pushSprite(0, 0);
 }
 
@@ -613,7 +900,71 @@ static void drawPlayer() {
     canvas.pushSprite(0, 0);
 }
 
+static void drawFileServer() {
+    canvas.fillSprite(TFT_BLACK);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextSize(1);
+    canvas.setTextDatum(top_center);
+    canvas.setTextColor(TFT_CYAN);
+    canvas.drawString("Fileserver", 120, 4);
+    canvas.drawFastHLine(0, 15, 240, TFT_DARKGREY);
+
+    // join these, then open the URL below
+    canvas.setTextDatum(top_left);
+    canvas.setTextColor(TFT_DARKGREY);
+    canvas.drawString("Wi-Fi", 6, 21);
+    canvas.drawString("Pass", 6, 32);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.drawString(AP_SSID, 48, 21);
+    canvas.drawString(AP_PASS, 48, 32);
+
+    canvas.setTextDatum(top_center);
+    canvas.setTextSize(2);
+    canvas.setTextColor(TFT_GREENYELLOW);
+    canvas.drawString("http://" + apIP.toString(), 120, 48);
+    canvas.setTextSize(1);
+    canvas.setTextColor(TFT_DARKGREY);
+    canvas.drawString(String("or http://") + AP_HOST + ".local", 120, 68);
+
+    const int clients = (int)WiFi.softAPgetStationNum();
+    canvas.setTextDatum(top_left);
+    canvas.setTextColor(clients ? TFT_GREEN : TFT_DARKGREY);
+    canvas.drawString(String(clients) + (clients == 1 ? " client" : " clients"), 6, 86);
+    canvas.setTextDatum(top_right);
+    if (sdOk) {
+        canvas.setTextColor(TFT_DARKGREY);
+        canvas.drawString(String(servedRequests) + " req", 234, 86);
+    } else {
+        canvas.setTextColor(TFT_RED);
+        canvas.drawString("No SD card", 234, 86);
+    }
+
+    if (xferName.length()) {
+        canvas.setTextDatum(top_left);
+        canvas.setTextColor(TFT_CYAN);
+        canvas.drawString(xferName, 6, 100);
+        canvas.setTextDatum(top_right);
+        canvas.setTextColor(TFT_DARKGREY);
+        const uint32_t pct = xferTotal ? (uint32_t)((uint64_t)xferSent * 100 / xferTotal) : 0;
+        canvas.drawString(String(pct) + "%", 234, 100);
+        canvas.drawRect(6, 112, 228, 6, TFT_DARKGREY);
+        const int w = xferTotal ? (int)((uint64_t)xferSent * 226 / xferTotal) : 0;
+        if (w > 0) canvas.fillRect(7, 113, w, 4, TFT_CYAN);
+    } else {
+        drawStatusMsg();
+    }
+
+    canvas.setTextDatum(bottom_center);
+    canvas.setTextColor(TFT_DARKGREY);
+    canvas.drawString("fn+`: stop server & back", 120, 133);
+    canvas.pushSprite(0, 0);
+}
+
 // ---------- arduino ----------
+// The HTTP handlers, and the screen refresh they call into mid-transfer, run
+// on the loop task; 8 KB is not enough headroom for that plus the WiFi stack.
+SET_LOOP_TASK_STACK_SIZE(32 * 1024);
+
 void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);  // enable keyboard
@@ -641,10 +992,12 @@ void loop() {
         case Screen::Browser:  handleBrowser(k); break;
         case Screen::Recorder: handleRecorder(k); break;
         case Screen::Player:   handlePlayer(k); break;
+        case Screen::FileServer: handleFileServer(k); break;
     }
 
     pumpAudio();
     pumpPlayback();
+    if (serverRunning) httpServer.handleClient();
 
     static uint32_t lastDraw = 0;
     if (millis() - lastDraw >= 50) {
@@ -654,6 +1007,7 @@ void loop() {
             case Screen::Browser:  drawBrowser(); break;
             case Screen::Recorder: drawRecorder(); break;
             case Screen::Player:   drawPlayer(); break;
+            case Screen::FileServer: drawFileServer(); break;
         }
     }
 }

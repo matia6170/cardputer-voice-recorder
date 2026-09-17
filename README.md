@@ -6,4 +6,5 @@ A PlatformIO firmware project for the M5Stack Cardputer that turns the device in
 - **File browser** — navigate, select, and delete recordings stored in the `/recordings` directory on the SD card
 - **WAV playback** — play back any WAV file with adjustable volume using the left/right arrow keys during playback
 - **Menu-driven UI** — a canvas-based display with a simple two-item main menu (File Browser / Voice Recorder), keyboard navigation, and status messages
+- **Fileserver** — brings up a `GGBOWL-rec` Wi-Fi access point and serves the entire SD card over HTTP, so any phone or laptop can browse and download files without a card reader
 - **SD card support** — mounts and reads from an SD card over SPI; recordings are auto-named and flushed periodically to prevent data loss on unexpected shutdown
